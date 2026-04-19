@@ -12,29 +12,128 @@ BOLD='\033[1m'
 RESET='\033[0m'
 
 usage() {
-  echo "Usage: $(basename "$0") <oss-pr-number> [ent-release-tag]"
+  echo "Usage: $(basename "$0") [--ent] <pr-number> [release-tag]"
   echo ""
   echo "Examples:"
-  echo "  $(basename "$0") 1540                  # full scan"
-  echo "  $(basename "$0") 1540 v2.4.0-beta.0    # check specific release"
+  echo "  $(basename "$0") 1540                  # track OSS PR (full scan)"
+  echo "  $(basename "$0") 1540 v2.4.0-beta.0    # track OSS PR, check specific ENT release"
+  echo "  $(basename "$0") --ent 478             # track ENT PR (full scan)"
+  echo "  $(basename "$0") --ent 478 v2.3.0      # track ENT PR, check specific release"
   exit 1
 }
 
+# --- Parse arguments ---
+IS_ENT=false
+if [[ "${1:-}" == "--ent" ]]; then
+  IS_ENT=true
+  shift
+fi
+
 [[ $# -lt 1 ]] && usage
-OSS_PR="$1"
-ENT_TAG="${2:-}"
+PR_NUM="$1"
+RELEASE_TAG="${2:-}"
 
-# --- Step 1: Get OSS PR info ---
-echo -e "\n${BOLD}=== OSS PR #${OSS_PR} ===${RESET}"
+# --- ENT PR mode ---
+if [[ "$IS_ENT" == true ]]; then
+  echo -e "\n${BOLD}=== ENT PR #${PR_NUM} ===${RESET}"
 
-PR_JSON=$(gh pr view "$OSS_PR" --repo "$OSS_REPO" --json title,mergeCommit,mergedAt,body,state 2>&1) || {
-  echo -e "${RED}Error: could not fetch OSS PR #${OSS_PR}${RESET}"
+  PR_JSON=$(gh pr view "$PR_NUM" --repo "$ENT_REPO" --json title,mergeCommit,mergedAt,body,state,baseRefName 2>&1) || {
+    echo -e "${RED}Error: could not fetch ENT PR #${PR_NUM}${RESET}"
+    exit 1
+  }
+
+  PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
+  if [[ "$PR_STATE" != "MERGED" ]]; then
+    echo -e "${RED}PR #${PR_NUM} is not merged (state: ${PR_STATE})${RESET}"
+    exit 1
+  fi
+
+  PR_TITLE=$(echo "$PR_JSON" | jq -r '.title')
+  PR_SHA=$(echo "$PR_JSON" | jq -r '.mergeCommit.oid')
+  PR_SHA_SHORT="${PR_SHA:0:10}"
+  PR_MERGED=$(echo "$PR_JSON" | jq -r '.mergedAt[:10]')
+  PR_BASE=$(echo "$PR_JSON" | jq -r '.baseRefName')
+  PR_FIXES=$(echo "$PR_JSON" | jq -r '.body' | grep -oP '(?i)fixes\s+#?\K\d+|fixes\s+https://github\.com/[^/]+/[^/]+/issues/\K\d+' | head -1 || true)
+
+  echo -e "Title:        ${PR_TITLE}"
+  echo -e "Merge commit: ${CYAN}${PR_SHA_SHORT}${RESET} (${PR_SHA})"
+  echo -e "Merged:       ${PR_MERGED}"
+  echo -e "Base branch:  ${PR_BASE}"
+  [[ -n "$PR_FIXES" ]] && echo -e "Fixes:        #${PR_FIXES}"
+
+  # --- Check ENT releases ---
+  echo -e "\n${BOLD}=== ENT Release Check ===${RESET}"
+
+  check_ent_release_direct() {
+    local tag="$1"
+    local tag_date
+    tag_date=$(gh release view "$tag" --repo "$ENT_REPO" --json publishedAt --jq '.publishedAt[:10]' 2>/dev/null || echo "unknown")
+
+    local result
+    result=$(gh api "repos/${ENT_REPO}/compare/${tag}...${PR_SHA}" --jq '.status' 2>/dev/null || echo "error")
+
+    if [[ "$result" == "behind" || "$result" == "identical" ]]; then
+      echo -e "${GREEN}${tag}${RESET} (${tag_date}): INCLUDED"
+    elif [[ "$result" == "ahead" ]]; then
+      local ahead
+      ahead=$(gh api "repos/${ENT_REPO}/compare/${tag}...${PR_SHA}" --jq '.ahead_by' 2>/dev/null)
+      echo -e "${RED}${tag}${RESET} (${tag_date}): NOT included (${ahead} commits ahead)"
+    elif [[ "$result" == "diverged" ]]; then
+      local branch
+      branch=$(gh api "repos/${ENT_REPO}/commits/${tag}/branches-where-head" --jq '.[0].name' 2>/dev/null || true)
+
+      if [[ -z "$branch" || "$branch" == "null" ]]; then
+        local major_minor
+        major_minor=$(echo "$tag" | grep -oP 'v\d+\.\d+' || true)
+        if [[ -n "$major_minor" ]]; then
+          local candidate="${major_minor}.x"
+          local branch_exists
+          branch_exists=$(gh api "repos/${ENT_REPO}/branches/${candidate}" --jq '.name' 2>/dev/null || true)
+          [[ -n "$branch_exists" && "$branch_exists" != "null" ]] && branch="$candidate"
+        fi
+      fi
+
+      if [[ -n "$branch" && "$branch" != "null" ]]; then
+        local branch_result
+        branch_result=$(gh api "repos/${ENT_REPO}/compare/${branch}...${PR_SHA}" --jq '.status' 2>/dev/null || echo "error")
+        if [[ "$branch_result" == "behind" || "$branch_result" == "identical" ]]; then
+          echo -e "${GREEN}${tag}${RESET} (${tag_date}): INCLUDED (PR merged to ${PR_BASE}, reachable from ${branch})"
+        else
+          echo -e "${RED}${tag}${RESET} (${tag_date}): NOT included (PR on ${PR_BASE}, not reachable from ${branch})"
+        fi
+      else
+        echo -e "${RED}${tag}${RESET} (${tag_date}): NOT included (diverged, could not determine release branch)"
+      fi
+    else
+      echo -e "${YELLOW}${tag}${RESET} (${tag_date}): could not compare (${result})"
+    fi
+  }
+
+  if [[ -n "$RELEASE_TAG" ]]; then
+    check_ent_release_direct "$RELEASE_TAG"
+  else
+    ENT_RELEASES=$(gh release list --repo "$ENT_REPO" --limit 10 --json tagName --jq '.[].tagName')
+    while read -r tag; do
+      [[ -z "$tag" ]] && continue
+      check_ent_release_direct "$tag"
+    done <<< "$ENT_RELEASES"
+  fi
+
+  echo ""
+  exit 0
+fi
+
+# --- OSS PR mode (original flow) ---
+echo -e "\n${BOLD}=== OSS PR #${PR_NUM} ===${RESET}"
+
+PR_JSON=$(gh pr view "$PR_NUM" --repo "$OSS_REPO" --json title,mergeCommit,mergedAt,body,state 2>&1) || {
+  echo -e "${RED}Error: could not fetch OSS PR #${PR_NUM}${RESET}"
   exit 1
 }
 
 PR_STATE=$(echo "$PR_JSON" | jq -r '.state')
 if [[ "$PR_STATE" != "MERGED" ]]; then
-  echo -e "${RED}PR #${OSS_PR} is not merged (state: ${PR_STATE})${RESET}"
+  echo -e "${RED}PR #${PR_NUM} is not merged (state: ${PR_STATE})${RESET}"
   exit 1
 fi
 
@@ -49,7 +148,7 @@ echo -e "Merge commit: ${CYAN}${PR_SHA_SHORT}${RESET} (${PR_SHA})"
 echo -e "Merged:       ${PR_MERGED}"
 [[ -n "$PR_FIXES" ]] && echo -e "Fixes:        #${PR_FIXES}"
 
-# --- Step 2: Check against OSS release tags ---
+# --- Check against OSS release tags ---
 echo -e "\n${BOLD}=== OSS Release Check ===${RESET}"
 
 OSS_RELEASES=$(gh release list --repo "$OSS_REPO" --limit 10 --json tagName,publishedAt \
@@ -68,7 +167,7 @@ while read -r tag date; do
   fi
 done <<< "$OSS_RELEASES"
 
-# --- Step 3: Find ENT sync PRs that include this commit ---
+# --- Find ENT sync PRs that include this commit ---
 echo -e "\n${BOLD}=== Sync to solo-main ===${RESET}"
 
 SYNC_PRS=$(gh pr list --repo "$ENT_REPO" --search "sync upstream in:title" --state merged --limit 30 \
@@ -96,6 +195,7 @@ while read -r num date title; do
   fi
 done <<< "$SYNC_PRS"
 
+SYNC_MERGE_SHA=""
 if [[ -n "$FIRST_SYNC" ]]; then
   echo -e "${GREEN}First sync: ${FIRST_SYNC}${RESET}"
   if [[ ${#SKIPPED[@]} -gt 0 ]]; then
@@ -106,10 +206,10 @@ if [[ -n "$FIRST_SYNC" ]]; then
 else
   echo -e "${RED}Not yet synced to solo-main${RESET}"
   echo -e "Latest sync PRs checked but none include this commit."
-  [[ -z "$ENT_TAG" ]] && exit 0
+  [[ -z "$RELEASE_TAG" ]] && exit 0
 fi
 
-# --- Step 4: Check ENT releases ---
+# --- Check ENT releases ---
 echo -e "\n${BOLD}=== ENT Release Check ===${RESET}"
 
 check_ent_release() {
@@ -169,8 +269,8 @@ check_ent_release() {
   fi
 }
 
-if [[ -n "$ENT_TAG" ]]; then
-  check_ent_release "$ENT_TAG"
+if [[ -n "$RELEASE_TAG" ]]; then
+  check_ent_release "$RELEASE_TAG"
 else
   ENT_RELEASES=$(gh release list --repo "$ENT_REPO" --limit 10 --json tagName --jq '.[].tagName')
   while read -r tag; do
