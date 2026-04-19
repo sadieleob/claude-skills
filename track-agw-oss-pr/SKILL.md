@@ -6,7 +6,25 @@ argument-hint: <oss-pr-number> [ent-release-tag]
 
 # Track AgentGateway OSS PR
 
-Run the tracking script and present results to the user.
+## Problem
+
+When a bug fix or feature is merged in the open-source AgentGateway repo, customers ask "is this fix in my version?" There's no simple way to answer that because:
+
+1. OSS changes don't go directly into enterprise releases
+2. They first get synced to an internal branch (`solo-main`) via sync PRs
+3. Releases are cut from separate release branches (`v2.3.x`, `v2.4.x`)
+4. A fix being on `solo-main` doesn't mean it's in a release
+
+Tracing this manually requires 5+ GitHub API calls and understanding the branch model.
+
+## How the skill works
+
+You give it an OSS PR number, and it traces the full journey:
+
+- **Step 1** — Gets the PR's merge commit SHA from OSS `main`
+- **Step 2** — Checks which OSS releases include it
+- **Step 3** — Finds which enterprise sync PR picked it up (by comparing OSS commit positions)
+- **Step 4** — Checks enterprise release branches to determine which shipped versions include it
 
 ## Steps
 
