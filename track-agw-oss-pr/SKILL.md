@@ -1,6 +1,6 @@
 ---
 name: track-agw-oss-pr
-description: Track an AgentGateway PR (OSS or ENT) through enterprise syncs and releases. Use when asked "is agentgateway PR X in enterprise?", "did agentgateway PR X make it to release Y?", "is ENT PR X in v2.3.0?", or "track agentgateway PR".
+description: "Track an AgentGateway PR (OSS or ENT) through enterprise syncs and releases. Use when asked 'is agentgateway PR X in enterprise?', 'did agentgateway PR X make it to release Y?', 'is ENT PR X in v2.3.0?', or 'track agentgateway PR'."
 argument-hint: [--ent] <pr-number> [release-tag]
 ---
 
